@@ -217,19 +217,9 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
   private endSink(end: pull.EndOrError = true) {
     if (!this.sinkState.askEnd(end)) return
 
-    const cont = (end: pull.Abort) => {
-      this.sinkState.ended(end)
-      if (!this._opts.allowHalfOpen) {
-        this._opts.abortEagerly ? this.abortSource(end) : this.endSource(end)
-      }
-    }
-
-    if (this._rawSinkRead) {
-      this._rawSinkRead(end, (end) => {
-        cont(end)
-      })
-    } else {
-      cont(end)
+    this.sinkState.ended(end)
+    if (!this._opts.allowHalfOpen) {
+      this._opts.abortEagerly ? this.abortSource(end) : this.endSource(end)
     }
   }
 
