@@ -110,10 +110,12 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
 
   end(end?: pull.EndOrError) {
     this.endSource(end)
+    this.endSink(end)
   }
 
   abort(end?: pull.EndOrError) {
     this.abortSource(end)
+    this.abortSink(end)
   }
 
   sourceDrain() {
