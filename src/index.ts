@@ -19,6 +19,7 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
   private _source: pull.Source<In> | null = null
   private _sink: pull.Sink<Out> | null = null
   private _rawSinkRead: pull.Source<Out> | null = null
+  private _reentered = 0
 
   protected readonly sourceCbs: pull.SourceCallback<In>[] = []
 
@@ -119,7 +120,32 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
   }
 
   sourceDrain() {
-    if (this.sourceState.aborting) {
+    if (this.drainAbort()) return
+
+    this.drainNormal()
+    if (this.drainAbort()) return
+
+    this.drainEnd()
+    if (this.drainAbort()) return
+  }
+
+  push(data: In, toHead = false) {
+    if (!this.sourceState.normal) return false
+
+    if (toHead) {
+      this.buffer.unshift(data)
+    } else {
+      this.buffer.push(data)
+    }
+    this.sourceDrain()
+    return true
+  }
+
+  private drainAbort() {
+    if (!this.sourceState.aborting || this._reentered > 0) return false
+    this._reentered++
+
+    try {
       const end = this.sourceState.aborting
       // call of all waiting callback functions
       while (this.sourceCbs.length > 0) {
@@ -133,23 +159,39 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
       if (!this._opts.allowHalfOpen) {
         this._opts.abortEagerly ? this.abortSink(end) : this.endSink(end)
       }
-      return
+    } finally {
+      this._reentered--
     }
+    return true
+  }
 
-    while (this.buffer.length > 0) {
-      const cb = this.sourceCbs.shift()
-      if (cb) {
-        const data = this.buffer.shift()!
-        cb(null, data)
-        if (this._opts.onSent) {
-          this._opts.onSent(data)
+  private drainNormal() {
+    if (this._reentered > 0) return
+
+    this._reentered++
+    try {
+      while (this.buffer.length > 0) {
+        const cb = this.sourceCbs.shift()
+        if (cb) {
+          const data = this.buffer.shift()!
+          cb(null, data)
+          if (this._opts.onSent) {
+            this._opts.onSent(data)
+          }
+        } else {
+          break
         }
-      } else {
-        break
       }
+    } finally {
+      this._reentered--
     }
+  }
 
-    if (this.sourceState.ending) {
+  private drainEnd() {
+    if (!this.sourceState.ending || this._reentered > 0) return
+    this._reentered++
+
+    try {
       if (this.buffer.length > 0) return
 
       const end = this.sourceState.ending
@@ -164,19 +206,9 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
       if (!this._opts.allowHalfOpen) {
         this._opts.abortEagerly ? this.abortSink(end) : this.endSink(end)
       }
+    } finally {
+      this._reentered--
     }
-  }
-
-  push(data: In, toHead = false) {
-    if (!this.sourceState.normal) return false
-
-    if (toHead) {
-      this.buffer.unshift(data)
-    } else {
-      this.buffer.push(data)
-    }
-    this.sourceDrain()
-    return true
   }
 
   private abortSource(end: pull.EndOrError = true) {
