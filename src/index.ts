@@ -4,22 +4,39 @@ import { SinkState } from './sink-state'
 import { noop, trueToNull } from './utils'
 
 export type OnReceivedCallback = (end?: pull.EndOrError) => void
-export type OnReadCallback<In> = (end?: pull.EndOrError, data?: In) => void
+export type OnReadCallback<In, State> = (end?: pull.EndOrError, data?: In, newState?: State) => void
+export type OnReadAbortCallback<State> = (newState?: State) => void
+export type OnRawReadCallback = () => void
 
-export interface DuplexOptions<In, Out> {
+export interface DuplexOptions<In, Out, State> {
   allowHalfOpen: boolean
   abortEagerly: boolean
-  onReceived: (this: PushableDuplex<In, Out>, data: Out, cb: OnReceivedCallback) => void
-  onRead: (this: PushableDuplex<In, Out>, cb: OnReadCallback<In>) => void
+  autoStartReading: boolean
+  initialState: State
+  onReceived: (this: PushableDuplex<In, Out, State>, data: Out, cb: OnReceivedCallback) => void
+  onRead: (
+    this: PushableDuplex<In, Out, State>,
+    cb: OnReadCallback<In, State>,
+    state: State | undefined
+  ) => void
+  onReadAbort: (err: pull.Abort, cb: OnReadAbortCallback<State>, state: State | undefined) => void
+  onRawReadEnd: (err: pull.EndOrError, cb: OnRawReadCallback) => void
   onSent: (data: In) => void
+  onSourceEnded: (err: pull.EndOrError) => void
+  onSinkEnded: (err: pull.EndOrError) => void
   onFinished: (err: pull.EndOrError) => void
 }
 
-export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
+export class PushableDuplex<In, Out, State> implements pull.Duplex<In, Out> {
   private _source: pull.Source<In> | null = null
   private _sink: pull.Sink<Out> | null = null
   private _rawSinkRead: pull.Source<Out> | null = null
   private _reentered = 0
+  private _state: State | undefined = undefined
+  private _autoStartReading: boolean
+  private _readStarted: boolean
+  private _onSourceEndedCalled = false
+  private _onSinkEndedCalled = false
 
   protected readonly sourceCbs: pull.SourceCallback<In>[] = []
 
@@ -27,9 +44,13 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
   public readonly sourceState: SourceState
   public readonly sinkState: SinkState
 
-  constructor(private _opts: Partial<DuplexOptions<In, Out>> = {}) {
+  constructor(private _opts: Partial<DuplexOptions<In, Out, State>> = {}) {
     _opts.allowHalfOpen = _opts.allowHalfOpen ?? false
     _opts.abortEagerly = _opts.abortEagerly ?? false
+    this._state = _opts.initialState
+    this._autoStartReading = _opts.autoStartReading ?? true
+    this._readStarted = false
+
     this.sourceState = new SourceState({
       onEnd: this.finish.bind(this),
     })
@@ -37,6 +58,12 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     this.sinkState = new SinkState({
       onEnd: this.finish.bind(this),
     })
+  }
+
+  startReading() {
+    if (this._rawSinkRead) {
+      this.readLoop()
+    }
   }
 
   get source() {
@@ -50,17 +77,39 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
         self.sourceCbs.push(cb)
 
         if (abort) {
-          self.sourceState.askAbort(abort)
+          if (self.sourceState.askAbort(abort)) {
+            if (self._opts.onReadAbort) {
+              self._opts.onReadAbort.call(
+                self,
+                abort,
+                (newState) => {
+                  if (newState !== undefined) {
+                    self._state = newState
+                  }
+                  self.sourceDrain()
+                },
+                self._state
+              )
+              return
+            }
+          }
         } else {
           if (self._opts.onRead) {
-            self._opts.onRead.call(self, (end, data) => {
-              if (end) {
-                self.sourceState.askEnd(end)
-              } else if (typeof data !== 'undefined') {
-                self.push(data)
-              }
-              self.sourceDrain()
-            })
+            self._opts.onRead.call(
+              self,
+              (end, data, newState) => {
+                if (end) {
+                  self.sourceState.askEnd(end)
+                  self.sourceDrain()
+                } else if (typeof data !== 'undefined') {
+                  if (newState !== undefined) {
+                    self._state = newState
+                  }
+                  self.push(data)
+                }
+              },
+              self._state
+            )
             return
           }
         }
@@ -75,38 +124,16 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
       const self = this
       this._sink = function (read) {
         self._rawSinkRead = read
-        if (!self.sinkState.normal) return
-
-        self._rawSinkRead(self.sinkState.finishing || self.sinkState.finished, function next(
-          end,
-          data
-        ) {
-          if (end) {
-            if (self.sinkState.ended(end)) {
-              if (!self._opts.allowHalfOpen) {
-                self._opts.abortEagerly ? self.abortSource(end) : self.endSource(end)
-              }
-            }
-            return
-          }
-          if (self._opts.onReceived) {
-            if (self._opts.onReceived.length === 1) {
-              // no cb provided, go the sync way
-              self._opts.onReceived.call(self, data!, noop)
-              self._rawSinkRead!(self.sinkState.finishing || self.sinkState.finished, next)
-            } else {
-              self._opts.onReceived.call(self, data!, (end) => {
-                if (end) {
-                  self.sinkState.askEnd(end)
-                }
-                self._rawSinkRead!(self.sinkState.finishing || self.sinkState.finished, next)
-              })
-            }
-          }
-        })
+        if (self._autoStartReading) {
+          self.readLoop()
+        }
       }
     }
     return this._sink
+  }
+
+  get readStarted() {
+    return this._readStarted
   }
 
   end(end?: pull.EndOrError) {
@@ -139,6 +166,52 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     }
     this.sourceDrain()
     return true
+  }
+
+  private readLoop() {
+    if (this._readStarted) return
+    this._readStarted = true
+
+    if (!this.sinkState.normal) return
+
+    const self = this
+    this._rawSinkRead!(self.sinkState.finishing || self.sinkState.finished, function next(
+      end,
+      data
+    ) {
+      if (end) {
+        if (self._opts.onRawReadEnd) {
+          self._opts.onRawReadEnd(end, () => {
+            if (self.sinkState.ended(end)) {
+              if (!self._opts.allowHalfOpen) {
+                self._opts.abortEagerly ? self.abortSource(end) : self.endSource(end)
+              }
+            }
+          })
+        } else {
+          if (self.sinkState.ended(end)) {
+            if (!self._opts.allowHalfOpen) {
+              self._opts.abortEagerly ? self.abortSource(end) : self.endSource(end)
+            }
+          }
+        }
+        return
+      }
+      if (self._opts.onReceived) {
+        if (self._opts.onReceived.length === 1) {
+          // no cb provided, go the sync way
+          self._opts.onReceived.call(self, data!, noop)
+          self._rawSinkRead!(self.sinkState.finishing || self.sinkState.finished, next)
+        } else {
+          self._opts.onReceived.call(self, data!, (end) => {
+            if (end) {
+              self.sinkState.askEnd(end)
+            }
+            self._rawSinkRead!(self.sinkState.finishing || self.sinkState.finished, next)
+          })
+        }
+      }
+    })
   }
 
   private drainAbort() {
@@ -211,7 +284,7 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     }
   }
 
-  private abortSource(end: pull.EndOrError = true) {
+  abortSource(end: pull.EndOrError = true) {
     if (!this.sourceState.askAbort(end)) return
     this.sourceDrain()
 
@@ -220,7 +293,7 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     }
   }
 
-  private endSource(end: pull.EndOrError = true) {
+  endSource(end: pull.EndOrError = true) {
     if (!this.sourceState.askEnd(end)) return
     this.sourceDrain()
 
@@ -229,7 +302,7 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     }
   }
 
-  private abortSink(abort: pull.Abort = true) {
+  abortSink(abort: pull.Abort = true) {
     if (!this.sinkState.askAbort(abort)) return
 
     const cont = (end: pull.Abort) => {
@@ -248,7 +321,7 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
     }
   }
 
-  private endSink(end: pull.EndOrError = true) {
+  endSink(end: pull.EndOrError = true) {
     if (!this.sinkState.askEnd(end)) return
 
     this.sinkState.ended(end)
@@ -258,6 +331,16 @@ export class PushableDuplex<In, Out> implements pull.Duplex<In, Out> {
   }
 
   private finish() {
+    if (this.sourceState.finished && this._opts.onSourceEnded && !this._onSourceEndedCalled) {
+      this._onSourceEndedCalled = true
+      this._opts.onSourceEnded(this.sourceState.finished)
+    }
+
+    if (this.sinkState.finished && this._opts.onSinkEnded && !this._onSinkEndedCalled) {
+      this._onSinkEndedCalled = true
+      this._opts.onSinkEnded(this.sinkState.finished)
+    }
+
     if (this.sourceState.finished && this.sinkState.finished) {
       const err = trueToNull(this.sourceState.finished) || trueToNull(this.sinkState.finished)
       this._opts.onFinished?.(err)

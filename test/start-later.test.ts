@@ -2,37 +2,32 @@ import * as pull from 'pull-stream'
 import { PushableDuplex } from '../src'
 import { getProbe, valuesToRead } from './common'
 
-jest.setTimeout(2000)
+describe('start later', () => {
+  it('ex1', (done) => {
+    const startTime = Date.now()
+    const waitFor = 500
 
-describe('onReceived', () => {
-  it('async callback', (done) => {
-    const testError = new Error('test error')
     const s1Values = [1, 2, 3]
     const s2Values = ['a', 'b', 'c']
     const results: any[] = []
     const d = new PushableDuplex({
       allowHalfOpen: true,
+      autoStartReading: false,
       onRead: valuesToRead(s1Values),
-      onReceived: (data, cb) => {
+      onReceived: (data) => {
         results.push(data)
-        cb(testError)
       },
       onFinished: (err) => {
-        expect(err).toBe(testError)
-        expect(results).toEqual(s2Values.slice(0, 1))
+        expect(err).toBeNull()
+        expect(results).toEqual(s2Values)
+        const elapsed = Date.now() - startTime
+        expect(elapsed).toBeGreaterThan((waitFor / 5) * 4)
         done()
       },
     })
+
     const peer = {
-      source: pull(
-        pull.values(s2Values),
-        getProbe(),
-        pull.asyncMap((data, cb) => {
-          setTimeout(() => {
-            cb(null, data)
-          }, 50)
-        })
-      ),
+      source: pull(pull.values(s2Values), getProbe()),
       sink: pull(
         getProbe(),
         pull.collect((err, results) => {
@@ -42,5 +37,9 @@ describe('onReceived', () => {
       ),
     }
     pull(d, peer, d)
+
+    setTimeout(() => {
+      d.startReading()
+    }, waitFor)
   })
 })

@@ -7,7 +7,7 @@ export function getProbe() {
 
 export function valuesToRead<T>(values: T[] = [], delay = 0) {
   let i = 0
-  return (cb: OnReadCallback<T>) => {
+  return (cb: OnReadCallback<T, any>) => {
     if (delay <= 0) {
       i === values.length ? cb(true) : cb(null, values[i])
       i += 1
